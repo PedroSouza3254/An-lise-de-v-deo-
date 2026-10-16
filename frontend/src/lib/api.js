@@ -113,4 +113,18 @@ export const getStats = (params = {}) => client.get("/stats", { params }).then((
 export const getAthleteSummary = (id) => client.get(`/athletes/${id}/summary`).then((r) => r.data);
 export const compareGroups = (groups) => client.post("/compare", { groups }).then((r) => r.data);
 
+// K-phases (modelos táticos)
+export const getKphases = (model) => client.get("/kphases", { params: model ? { model } : {} }).then((r) => r.data);
+export const createKphase = (body) => client.post("/kphases", body).then((r) => r.data);
+export const updateKphase = (id, body) => client.put(`/kphases/${id}`, body).then((r) => r.data);
+export const deleteKphase = (id) => client.delete(`/kphases/${id}`).then((r) => r.data);
+
+// Sugestão automática de fase
+export const suggestPhase = (body) => client.post("/suggest-phase", body).then((r) => r.data);
+
+// Rallies & placar
+export const closePoint = (body) => client.post("/rallies/close-point", body).then((r) => r.data);
+export const setRallyWinner = (id, winner) => client.put(`/rallies/${id}/winner`, { winner }).then((r) => r.data);
+export const getRalliesFull = (videoId) => client.get(`/videos/${videoId}/rallies-full`).then((r) => r.data);
+
 export default client;

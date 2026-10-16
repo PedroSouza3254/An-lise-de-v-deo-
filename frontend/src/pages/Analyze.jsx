@@ -7,23 +7,25 @@ import { CourtMap } from "@/components/CourtMap";
 import {
   getVideo, getFundamentos, getClassificacoes, getAthletes, getPositions, getFormations, getSettings,
   getActions, createAction, updateAction, deleteAction, setVideoStatus, linkRally,
+  getKphases, suggestPhase, closePoint, setRallyWinner, getRalliesFull, updateVideo,
 } from "@/lib/api";
 import { formatTime } from "@/lib/format";
+import { Scoreboard } from "@/components/Scoreboard";
 import {
   Play, Pause, Rewind, FastForward, Plus, Trash2, Save, MousePointer2, ArrowUpRight,
   Minus, Square, Circle, Type, Spline, Undo2, Eraser, Clock, Check, Users, X, Scissors, Link2, MapPin,
+  Trophy, Repeat, ListOrdered, Sparkles, Settings2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
+const COLORS = ["#E50914", "#F59E0B", "#10B981", "#3B82F6", "#FFFFFF"];
 const TOOLS = [
   { id: "select", icon: MousePointer2 }, { id: "arrow", icon: ArrowUpRight }, { id: "line", icon: Minus },
   { id: "rect", icon: Square }, { id: "ellipse", icon: Circle }, { id: "trajectory", icon: Spline }, { id: "text", icon: Type },
 ];
-const COLORS = ["#E50914", "#F59E0B", "#10B981", "#3B82F6", "#FFFFFF"];
-const SITUATIONS = ["K1", "K2", "K3", "Continuidade", "Contra-ataque"];
 const RESULTS = ["Ponto nosso", "Ponto adversário", "Continuidade"];
-const base = { fundamento_id: "", classificacao_id: "", athlete_ids: [], tactical_position: "", phase: "", note: "", clip_before: 5, clip_after: 4, set_number: "", formation: "", result: "", court: null };
+const base = { fundamento_id: "", classificacao_id: "", athlete_ids: [], tactical_position: "", phase: "", note: "", clip_before: 5, clip_after: 4, set_number: "", formation: "", result: "", court: null, team: "nos" };
 
 export default function Analyze() {
   const { videoId } = useParams();
@@ -56,9 +58,17 @@ export default function Analyze() {
   const [showCourt, setShowCourt] = useState(true);
   const [rallySel, setRallySel] = useState([]);
   const [rallySit, setRallySit] = useState("K1");
+  const [kphases, setKphases] = useState([]);
+  const [rallies, setRallies] = useState([]);
+  const [servingTeam, setServingTeam] = useState("adv");
+  const [setNumber, setSetNumber] = useState(1);
   const clipStop = useRef(null);
 
   const reloadActions = useCallback(() => getActions({ video_id: videoId }).then(setActions), [videoId]);
+  const reloadRallies = useCallback(() => getRalliesFull(videoId).then(setRallies), [videoId]);
+
+  const phaseKeys = useMemo(() => (kphases.length ? kphases.map((k) => k.key) : ["K1", "K2", "K3"]), [kphases]);
+  const phaseName = (key) => kphases.find((k) => k.key === key)?.name || "";
 
   useEffect(() => {
     Promise.all([getVideo(videoId), getFundamentos(), getClassificacoes(), getAthletes(), getPositions(), getFormations(), getSettings(), getActions({ video_id: videoId })])
@@ -68,7 +78,47 @@ export default function Analyze() {
         setForm((fm) => ({ ...fm, clip_before: s.default_clip_before, clip_after: s.default_clip_after }));
         setActions(acts);
       });
-  }, [videoId]);
+    reloadRallies();
+  }, [videoId, reloadRallies]);
+
+  useEffect(() => {
+    if (video?.analysis_model) getKphases(video.analysis_model).then((k) => setKphases(k.filter((x) => x.active !== false)));
+  }, [video?.analysis_model]);
+
+  const changeModel = async (m) => {
+    await updateVideo(videoId, { ...video, analysis_model: m });
+    setVideo((v) => ({ ...v, analysis_model: m }));
+    toast.success(`Modelo de análise: ${m === "A" ? "K1–K2" : "K0–K5"}`);
+  };
+
+  // Placar sincronizado com o vídeo
+  const scoreAt = useCallback((t, set) => {
+    const rs = rallies.filter((r) => (r.set_number || 1) === set && r.end_ts != null && r.end_ts <= t).sort((a, b) => a.number - b.number);
+    return rs[rs.length - 1]?.score_after || { nos: 0, adv: 0 };
+  }, [rallies]);
+
+  const suggestFor = useCallback(async (fundId, teamVal) => {
+    const fund = funds.find((x) => x.id === fundId);
+    if (!fund) return;
+    const prior = actions.filter((x) => !x.rally_id);
+    try {
+      const { phase } = await suggestPhase({ model: video?.analysis_model || "B", fundamento_name: fund.name, team: teamVal || "nos", serving_team: servingTeam, prior });
+      if (phase) setForm((fm) => ({ ...fm, phase }));
+    } catch { /* noop */ }
+  }, [funds, actions, video, servingTeam]);
+
+  const registerPoint = async (winner) => {
+    await closePoint({ video_id: videoId, winner, set_number: setNumber, serving_team: servingTeam });
+    await Promise.all([reloadActions(), reloadRallies()]);
+    setServingTeam(winner); // vencedor do rally saca no próximo
+    toast.success(`Ponto ${winner === "nos" ? (video.equipe_name || "AVA") : (video.opponent || "Adversário")}! Rally encerrado.`);
+  };
+
+  const changeWinner = async (rallyId, winner) => {
+    await setRallyWinner(rallyId, winner);
+    await reloadRallies();
+    toast.success("Vencedor atualizado — placar recalculado");
+  };
 
   useEffect(() => {
     const t = sp.get("t"); const aid = sp.get("action");
@@ -95,14 +145,15 @@ export default function Analyze() {
     setMarkTime(now);
     setEditingId(null); setDrafting(true); setAnnos([]); setSelEl(null);
     const fund = funds.find((f) => f.id === fundId);
-    setForm((f) => ({ ...base, clip_before: f.clip_before, clip_after: f.clip_after, formation: f.formation, set_number: f.set_number, fundamento_id: fundId }));
+    setForm((f) => ({ ...base, clip_before: f.clip_before, clip_after: f.clip_after, formation: f.formation, set_number: f.set_number, fundamento_id: fundId, team: "nos" }));
     setShowCourt(fund?.uses_court !== false);
-    toast.info(`${fund?.name} marcado em ${formatTime(now)} — edite e salve`);
+    suggestFor(fundId, "nos");
+    toast.info(`${fund?.name} marcado em ${formatTime(now)} — fase sugerida, confira e salve`);
   };
 
   const selectAction = (a) => {
     setEditingId(a.id); setDrafting(true); setMarkTime(a.timestamp);
-    setForm({ fundamento_id: a.fundamento_id || "", classificacao_id: a.classificacao_id || "", athlete_ids: a.athlete_ids || [], tactical_position: a.tactical_position || "", phase: a.phase || "", note: a.note || "", clip_before: a.clip_before ?? 5, clip_after: a.clip_after ?? 4, set_number: a.set_number ?? "", formation: a.formation || "", result: a.result || "", court: a.court || null });
+    setForm({ fundamento_id: a.fundamento_id || "", classificacao_id: a.classificacao_id || "", athlete_ids: a.athlete_ids || [], tactical_position: a.tactical_position || "", phase: a.phase || "", note: a.note || "", clip_before: a.clip_before ?? 5, clip_after: a.clip_after ?? 4, set_number: a.set_number ?? "", formation: a.formation || "", result: a.result || "", court: a.court || null, team: a.team || "nos" });
     setAnnos(a.annotations || []); setSelEl(null);
     playerRef.current?.pause(); setPlaying(false); playerRef.current?.seekTo(a.timestamp);
   };
@@ -124,7 +175,7 @@ export default function Analyze() {
       note: form.note, clip_before: Number(form.clip_before), clip_after: Number(form.clip_after),
       clip_start: clipStart, clip_end: clipEnd, annotations: annos,
       set_number: form.set_number === "" ? null : Number(form.set_number), formation: form.formation || null,
-      result: form.result || null, court: form.court,
+      result: form.result || null, court: form.court, team: form.team || "nos",
     };
   };
 
@@ -165,8 +216,30 @@ export default function Analyze() {
   return (
     <Layout back="/galeria">
       <div className="mb-4 flex flex-wrap items-center gap-3">
-        <div className="min-w-0"><h1 className="ava-heading text-2xl sm:text-3xl font-extrabold truncate">{video.title}</h1><p className="text-sm text-muted-foreground">{video.competition || ""} {video.opponent ? `· vs ${video.opponent}` : ""}</p></div>
-        <button data-testid="mark-complete" onClick={markComplete} className="ml-auto inline-flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-sm font-semibold hover:border-emerald-500/50"><Check size={16} className="text-emerald-500" /> Concluir análise</button>
+        <div className="min-w-0"><h1 className="ava-heading text-2xl sm:text-3xl font-extrabold truncate">{video.title}</h1><p className="text-sm text-muted-foreground">{video.categoria_name ? `${video.categoria_name} · ` : ""}{video.competition || ""} {video.opponent ? `· vs ${video.opponent}` : ""}</p></div>
+        <div className="ml-auto flex items-center gap-2">
+          <div className="flex items-center gap-1 rounded-lg border border-border bg-card p-1" data-testid="model-selector">
+            <Settings2 size={14} className="text-muted-foreground ml-1" />
+            {[["A", "K1–K2"], ["B", "K0–K5"]].map(([k, lbl]) => (
+              <button key={k} data-testid={`model-${k}`} onClick={() => changeModel(k)} className={cn("rounded-md px-2.5 py-1 text-xs font-semibold transition", (video.analysis_model || "B") === k ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground")}>{lbl}</button>
+            ))}
+          </div>
+          <button data-testid="mark-complete" onClick={markComplete} className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-sm font-semibold hover:border-emerald-500/50"><Check size={16} className="text-emerald-500" /> Concluir análise</button>
+        </div>
+      </div>
+
+      {/* SCOREBOARD + PONTO */}
+      <div className="rounded-xl border border-border bg-card p-3 mb-4 flex flex-wrap items-center gap-3">
+        <Scoreboard home={video.equipe_name || "AVA"} away={video.opponent || "Adversário"} score={scoreAt(time, setNumber)} set={setNumber} serving={servingTeam} onServe={setServingTeam} />
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] text-muted-foreground uppercase tracking-wider">Set</span>
+          <select data-testid="set-select" value={setNumber} onChange={(e) => setSetNumber(Number(e.target.value))} className="rounded-lg border border-border bg-background px-2 py-1.5 text-sm outline-none">{[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n}</option>)}</select>
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-[11px] text-muted-foreground">Encerrar rally — ponto de:</span>
+          <button data-testid="point-nos" onClick={() => registerPoint("nos")} className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground hover:brightness-110"><Trophy size={13} /> {video.equipe_name || "AVA"}</button>
+          <button data-testid="point-adv" onClick={() => registerPoint("adv")} className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3 py-1.5 text-xs font-semibold text-background hover:opacity-90"><Trophy size={13} /> {video.opponent || "Adversário"}</button>
+        </div>
       </div>
 
       {/* QUICK MARK BAR */}
@@ -238,9 +311,16 @@ export default function Analyze() {
                 </div>
               </div>
 
+              <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Equipe da ação</label>
+              <div className="flex gap-1.5 mt-1 mb-3">
+                {[["nos", video.equipe_name || "AVA"], ["adv", video.opponent || "Adversário"]].map(([k, lbl]) => (
+                  <button key={k} data-testid={`team-${k}`} onClick={() => { setForm((fm) => ({ ...fm, team: k })); if (form.fundamento_id) suggestFor(form.fundamento_id, k); }} className={cn("flex-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold border transition", form.team === k ? (k === "nos" ? "bg-primary text-primary-foreground border-primary" : "bg-foreground text-background border-foreground") : "border-border text-muted-foreground hover:border-primary/40")}>{lbl}</button>
+                ))}
+              </div>
+
               <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Fundamento</label>
               <div className="flex flex-wrap gap-1.5 mt-1 mb-3">
-                {funds.map((f) => <button key={f.id} data-testid={`fund-${f.id}`} onClick={() => setForm((fm) => ({ ...fm, fundamento_id: f.id, classificacao_id: "" }))} className={cn("rounded-lg px-2.5 py-1.5 text-xs font-semibold border transition", form.fundamento_id === f.id ? "text-white border-transparent" : "border-border text-muted-foreground hover:border-primary/40")} style={form.fundamento_id === f.id ? { background: f.color } : {}}>{f.name}</button>)}
+                {funds.map((f) => <button key={f.id} data-testid={`fund-${f.id}`} onClick={() => { setForm((fm) => ({ ...fm, fundamento_id: f.id, classificacao_id: "" })); suggestFor(f.id, form.team); }} className={cn("rounded-lg px-2.5 py-1.5 text-xs font-semibold border transition", form.fundamento_id === f.id ? "text-white border-transparent" : "border-border text-muted-foreground hover:border-primary/40")} style={form.fundamento_id === f.id ? { background: f.color } : {}}>{f.name}</button>)}
               </div>
 
               {form.fundamento_id && (<><label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Classificação</label>
@@ -252,7 +332,7 @@ export default function Analyze() {
               <div className="grid grid-cols-3 gap-2 mb-3">
                 <label className="text-[11px] text-muted-foreground">Set<input type="number" data-testid="mark-set" value={form.set_number} onChange={(e) => setForm({ ...form, set_number: e.target.value })} className="w-full mt-0.5 rounded-lg border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-primary/60" /></label>
                 <label className="text-[11px] text-muted-foreground">Formação<select data-testid="mark-formation" value={form.formation} onChange={(e) => setForm({ ...form, formation: e.target.value })} className="w-full mt-0.5 rounded-lg border border-border bg-background px-1 py-1.5 text-sm outline-none focus:border-primary/60"><option value="">—</option>{formations.map((f) => <option key={f.id} value={f.name}>{f.name}</option>)}</select></label>
-                <label className="text-[11px] text-muted-foreground">Situação<select data-testid="mark-phase" value={form.phase} onChange={(e) => setForm({ ...form, phase: e.target.value })} className="w-full mt-0.5 rounded-lg border border-border bg-background px-1 py-1.5 text-sm outline-none focus:border-primary/60"><option value="">—</option>{SITUATIONS.map((s) => <option key={s} value={s}>{s}</option>)}</select></label>
+                <label className="text-[11px] text-muted-foreground flex items-center gap-1">Fase tática <Sparkles size={10} className="text-primary" /><select data-testid="mark-phase" value={form.phase} onChange={(e) => setForm({ ...form, phase: e.target.value })} className="w-full mt-0.5 rounded-lg border border-border bg-background px-1 py-1.5 text-sm outline-none focus:border-primary/60"><option value="">—</option>{phaseKeys.map((s) => <option key={s} value={s}>{s}{phaseName(s) ? ` · ${phaseName(s)}` : ""}</option>)}</select></label>
               </div>
               <div className="grid grid-cols-2 gap-2 mb-3">
                 <label className="text-[11px] text-muted-foreground">Posição no lance<select data-testid="mark-position" value={form.tactical_position} onChange={(e) => setForm({ ...form, tactical_position: e.target.value })} className="w-full mt-0.5 rounded-lg border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-primary/60"><option value="">—</option>{positions.map((p) => <option key={p.id} value={p.name}>{p.name}</option>)}</select></label>
@@ -292,7 +372,7 @@ export default function Analyze() {
               <h3 className="ava-heading text-lg font-bold">Lances ({actions.length})</h3>
               {rallySel.length > 0 && (
                 <div className="flex items-center gap-1.5">
-                  <select value={rallySit} onChange={(e) => setRallySit(e.target.value)} data-testid="rally-situation" className="rounded-lg border border-border bg-background px-2 py-1 text-xs outline-none">{SITUATIONS.map((s) => <option key={s} value={s}>{s}</option>)}</select>
+                  <select value={rallySit} onChange={(e) => setRallySit(e.target.value)} data-testid="rally-situation" className="rounded-lg border border-border bg-background px-2 py-1 text-xs outline-none">{phaseKeys.map((s) => <option key={s} value={s}>{s}</option>)}</select>
                   <button data-testid="link-rally" onClick={doLinkRally} className="inline-flex items-center gap-1 rounded-lg bg-primary px-2.5 py-1 text-xs font-semibold text-primary-foreground"><Link2 size={12} /> Relacionar ({rallySel.length})</button>
                 </div>
               )}
@@ -311,6 +391,7 @@ export default function Analyze() {
                         {a.classificacao_label && <span className="text-xs text-muted-foreground">· {a.classificacao_label}</span>}
                         {a.formation && <span className="text-[10px] rounded bg-secondary px-1">{a.formation}</span>}
                         {a.phase && <span className="text-[10px] rounded bg-primary/15 text-primary px-1">{a.phase}</span>}
+                        {a.team === "adv" && <span className="text-[10px] rounded bg-foreground/15 px-1">ADV</span>}
                         {a.court?.zone != null && <span className="text-[10px] rounded bg-secondary px-1">Z{a.court.zone}</span>}
                       </div>
                       <div className="text-xs text-muted-foreground truncate">{(a.athlete_ids || []).map((id) => athletes.find((x) => x.id === id)?.name).filter(Boolean).join(", ") || "—"}</div>
@@ -320,6 +401,41 @@ export default function Analyze() {
                   </div>
                 );
               })}
+            </div>
+          </div>
+
+          {/* RALLY HISTORY */}
+          <div className="rounded-xl border border-border bg-card overflow-hidden">
+            <div className="p-3 border-b border-border flex items-center gap-2">
+              <ListOrdered size={16} className="text-primary" />
+              <h3 className="ava-heading text-lg font-bold">Rallies ({rallies.length})</h3>
+              <span className="ml-auto text-[11px] text-muted-foreground">placar sincronizado com o vídeo</span>
+            </div>
+            <div className="divide-y divide-border max-h-[360px] overflow-auto scrollbar-thin">
+              {rallies.length === 0 ? (
+                <div className="p-5 text-center text-sm text-muted-foreground">Marque os lances e clique em “ponto de…” para encerrar o rally. As ações do ponto são agrupadas automaticamente.</div>
+              ) : rallies.map((r) => (
+                <div key={r.id} data-testid={`rally-${r.number}`} className="p-3">
+                  <div className="flex items-center gap-2">
+                    <span className="font-data text-xs text-muted-foreground w-10">#{r.number}</span>
+                    <span className={cn("rounded-full px-2 py-0.5 text-[11px] font-bold", r.winner === "nos" ? "bg-primary/15 text-primary" : "bg-foreground/15")}>
+                      <Trophy size={10} className="inline mr-0.5" />{r.winner === "nos" ? (video.equipe_name || "AVA") : (video.opponent || "ADV")}
+                    </span>
+                    <span className="font-data text-xs text-muted-foreground">{r.score_before?.nos ?? 0}-{r.score_before?.adv ?? 0} → <b className="text-foreground">{r.score_after?.nos ?? 0}-{r.score_after?.adv ?? 0}</b></span>
+                    <span className="text-[10px] rounded bg-secondary px-1">Set {r.set_number || 1}</span>
+                    <button data-testid={`rally-play-${r.number}`} onClick={() => r.start_ts != null && playerRef.current?.seekTo(Math.max(0, r.start_ts))} className="ml-auto h-6 w-6 rounded-lg bg-primary/15 flex items-center justify-center text-primary hover:bg-primary/25"><Play size={12} /></button>
+                    <button data-testid={`rally-winner-${r.number}`} onClick={() => changeWinner(r.id, r.winner === "nos" ? "adv" : "nos")} title="Trocar vencedor (recalcula placar)" className="h-6 w-6 rounded-lg border border-border flex items-center justify-center text-muted-foreground hover:text-primary"><Repeat size={12} /></button>
+                  </div>
+                  <div className="flex flex-wrap gap-1 mt-1.5 pl-10">
+                    {(r.actions || []).map((a) => (
+                      <button key={a.id} onClick={() => selectAction(a)} className="rounded bg-secondary/60 px-1.5 py-0.5 text-[10px] hover:bg-secondary">
+                        {a.fundamento_name}{a.phase ? ` · ${a.phase}` : ""}{a.team === "adv" ? " (adv)" : ""}
+                      </button>
+                    ))}
+                    {(r.actions || []).length === 0 && <span className="text-[11px] text-muted-foreground">sem ações vinculadas</span>}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         </div>

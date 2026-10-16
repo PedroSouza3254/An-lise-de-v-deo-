@@ -153,6 +153,7 @@ class VideoIn(BaseModel):
     categoria_name: Optional[str] = None
     season: Optional[str] = None       # temporada (ex: 2026)
     comp_phase: Optional[str] = None   # fase da competição (ex: Fase de grupos, Semifinal)
+    analysis_model: Optional[str] = "B"  # A (K1-K2) | B (K0-K5)
 
 
 class ActionIn(BaseModel):
@@ -169,7 +170,8 @@ class ActionIn(BaseModel):
     clip_after: float = 10.0
     annotations: List[Dict[str, Any]] = []
     rally_id: Optional[str] = None
-    phase: Optional[str] = None  # situação tática: K1 | K2 | K3 | continuidade | contra-ataque | custom
+    phase: Optional[str] = None  # situação tática / fase K (K0..K5)
+    team: Optional[str] = None   # nos | adv (equipe responsável pela ação)
     set_number: Optional[int] = None
     formation: Optional[str] = None  # rotação/formação (ex: P1)
     result: Optional[str] = None  # resultado da jogada (ponto/erro/continuidade)
@@ -524,6 +526,146 @@ async def delete_rally(item_id: str):
     await db.actions.update_many({"rally_id": item_id}, {"$set": {"rally_id": None}})
     await db.rallies.delete_one({"id": item_id})
     return {"ok": True}
+
+
+# ----------------- Análise tática: modelos K, rallies, placar -----------------
+class KPhaseIn(BaseModel):
+    model: str                  # A (K1-K2) | B (K0-K5)
+    key: str                    # K0..K5
+    name: str
+    description: Optional[str] = None
+    order: int = 0
+    active: bool = True
+
+
+class PhaseSuggestIn(BaseModel):
+    model: str = "B"
+    fundamento_name: Optional[str] = None
+    team: Optional[str] = None            # nos | adv
+    serving_team: Optional[str] = None    # nos | adv
+    prior: List[Dict[str, Any]] = []      # ações anteriores do rally atual
+
+
+@api_router.get("/kphases")
+async def list_kphases(model: Optional[str] = None):
+    q = {"model": model} if model else {}
+    return await db.kphases.find(q, {"_id": 0}).sort("order", 1).to_list(200)
+
+
+@api_router.post("/kphases")
+async def create_kphase(body: KPhaseIn):
+    return await insert("kphases", body.model_dump())
+
+
+@api_router.put("/kphases/{item_id}")
+async def update_kphase(item_id: str, body: KPhaseIn):
+    return await update("kphases", item_id, body.model_dump())
+
+
+@api_router.delete("/kphases/{item_id}")
+async def delete_kphase(item_id: str):
+    await db.kphases.delete_one({"id": item_id})
+    return {"ok": True}
+
+
+def _suggest_phase(model, fundamento, team, serving_team, prior):
+    f = (fundamento or "").lower()
+    model = (model or "B").upper()
+    receiving = (team and serving_team and team != serving_team)
+    prior = prior or []
+    n_attacks = sum(1 for a in prior if "ataque" in (a.get("fundamento_name") or "").lower() or "contra" in (a.get("fundamento_name") or "").lower())
+    had_block = any("bloqueio" in (a.get("fundamento_name") or "").lower() for a in prior)
+    if model == "A":
+        if "saque" in f:
+            return "K2"
+        if team and serving_team:
+            return "K2" if team == serving_team else "K1"
+        return "K1"
+    # Modelo B (K0-K5)
+    if "saque" in f:
+        return "K0"
+    if "cobertura" in f or (had_block and "continuidade" in f):
+        return "K4"
+    if "bola de graça" in f or "bola de graca" in f:
+        return "K5"
+    if receiving:
+        if n_attacks == 0 and ("recep" in f or "levant" in f or "ataque" in f):
+            return "K1"
+        if "defesa" in f or "contra" in f or "ataque" in f:
+            return "K3"
+        return "K3"
+    else:  # equipe que sacou / lado do saque
+        if "bloqueio" in f or "defesa" in f:
+            return "K2"
+        if "contra" in f or "ataque" in f:
+            return "K3"
+        return "K2"
+
+
+@api_router.post("/suggest-phase")
+async def suggest_phase(body: PhaseSuggestIn):
+    return {"phase": _suggest_phase(body.model, body.fundamento_name, body.team, body.serving_team, body.prior)}
+
+
+async def recalc_scores(video_id: str):
+    rallies = await db.rallies.find({"video_id": video_id}, {"_id": 0}).sort("number", 1).to_list(3000)
+    running: Dict[int, Dict[str, int]] = {}
+    for r in rallies:
+        if r.get("number") is None:
+            continue
+        s = r.get("set_number") or 1
+        cur = running.setdefault(s, {"nos": 0, "adv": 0})
+        before = dict(cur)
+        w = r.get("winner")
+        if w == "nos":
+            cur["nos"] += 1
+        elif w == "adv":
+            cur["adv"] += 1
+        await db.rallies.update_one({"id": r["id"]}, {"$set": {"score_before": before, "score_after": dict(cur)}})
+
+
+@api_router.post("/rallies/close-point")
+async def close_point(payload: Dict[str, Any]):
+    video_id = payload.get("video_id")
+    winner = payload.get("winner")            # nos | adv
+    set_number = payload.get("set_number") or 1
+    serving_team = payload.get("serving_team")
+    if not video_id or winner not in ("nos", "adv"):
+        raise HTTPException(400, "Informe video_id e o vencedor (nos/adv)")
+    open_actions = await db.actions.find({"video_id": video_id, "rally_id": None}, {"_id": 0}).sort("timestamp", 1).to_list(3000)
+    last = await db.rallies.find_one({"video_id": video_id, "number": {"$ne": None}}, {"_id": 0}, sort=[("number", -1)])
+    number = (last.get("number", 0) if last else 0) + 1
+    ts = [a.get("timestamp", 0) for a in open_actions]
+    rally = await insert("rallies", {
+        "video_id": video_id, "number": number, "set_number": int(set_number), "winner": winner,
+        "serving_team": serving_team, "start_ts": min(ts) if ts else None, "end_ts": max(ts) if ts else None,
+        "action_ids": [a["id"] for a in open_actions], "situation": None, "label": f"Rally {number}",
+    })
+    if open_actions:
+        await db.actions.update_many({"id": {"$in": [a["id"] for a in open_actions]}}, {"$set": {"rally_id": rally["id"]}})
+    await recalc_scores(video_id)
+    return await db.rallies.find_one({"id": rally["id"]}, {"_id": 0})
+
+
+@api_router.put("/rallies/{item_id}/winner")
+async def set_rally_winner(item_id: str, payload: Dict[str, Any]):
+    r = await db.rallies.find_one({"id": item_id}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Rally não encontrado")
+    await db.rallies.update_one({"id": item_id}, {"$set": {"winner": payload.get("winner")}})
+    await recalc_scores(r["video_id"])
+    return await db.rallies.find_one({"id": item_id}, {"_id": 0})
+
+
+@api_router.get("/videos/{video_id}/rallies-full")
+async def rallies_full(video_id: str):
+    rallies = await db.rallies.find({"video_id": video_id, "number": {"$ne": None}}, {"_id": 0}).sort("number", 1).to_list(3000)
+    acts = {a["id"]: a for a in await db.actions.find({"video_id": video_id}, {"_id": 0}).to_list(5000)}
+    for r in rallies:
+        rl = [acts[i] for i in r.get("action_ids", []) if i in acts]
+        rl.sort(key=lambda x: x.get("timestamp", 0))
+        r["actions"] = rl
+    return rallies
 
 
 # ----------------- Saved Filters -----------------
@@ -882,6 +1024,20 @@ async def seed():
     if await db.equipes.count_documents({}) == 0:
         await insert("equipes", {"name": "AVA", "order": 0, "active": True, "archived": False})
         logger.info("Seeded equipes")
+    if await db.kphases.count_documents({}) == 0:
+        kA = [("K1", "Side-out", "Recepção do saque adversário e construção ofensiva"),
+              ("K2", "Saque e defesa", "Saque, organização do bloqueio e da defesa")]
+        kB = [("K0", "Saque", "Execução e eficiência do saque"),
+              ("K1", "Side-out", "Recepção do saque adversário e construção ofensiva"),
+              ("K2", "Saque e organização defensiva", "Organização defensiva após o saque (bloqueio e defesa)"),
+              ("K3", "Transição e contra-ataque", "Recuperação, reorganização ofensiva e ataque após a defesa"),
+              ("K4", "Continuidade após bloqueio", "Cobertura e reorganização quando a bola bloqueada segue em jogo"),
+              ("K5", "Bola de graça", "Devolução sem ataque forte (fácil ou difícil)")]
+        for i, (k, n, d) in enumerate(kA):
+            await insert("kphases", {"model": "A", "key": k, "name": n, "description": d, "order": i, "active": True})
+        for i, (k, n, d) in enumerate(kB):
+            await insert("kphases", {"model": "B", "key": k, "name": n, "description": d, "order": i, "active": True})
+        logger.info("Seeded kphases")
 
     if await db.positions.count_documents({}) == 0:
         for i, name in enumerate(DEFAULT_POSITIONS):
@@ -1077,6 +1233,8 @@ async def migrate():
             patch["categoria_name"] = v.get("category")
         if not v.get("season"):
             patch["season"] = (v.get("match_date") or "")[:4] or "2026"
+        if not v.get("analysis_model"):
+            patch["analysis_model"] = "B"
         if patch:
             await db.videos.update_one({"id": v["id"]}, {"$set": patch})
     # 2) backfill denormalized context onto existing actions
